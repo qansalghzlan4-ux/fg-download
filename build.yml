@@ -1,0 +1,666 @@
+name: Build FG Download APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p FGDownload
+          cat > FGDownload/settings.gradle.kts <<'__FG_EOF__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FGDownload"
+          include(":app")
+          __FG_EOF__
+          mkdir -p FGDownload
+          cat > FGDownload/build.gradle.kts <<'__FG_EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __FG_EOF__
+          mkdir -p FGDownload
+          cat > FGDownload/gradle.properties <<'__FG_EOF__'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          __FG_EOF__
+          mkdir -p FGDownload/app
+          cat > FGDownload/app/build.gradle.kts <<'__FG_EOF__'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.fg.download"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.fg.download"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+              }
+              packaging { jniLibs { useLegacyPackaging = true } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.webkit:webkit:1.11.0")
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.+")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.+")
+          }
+          __FG_EOF__
+          mkdir -p FGDownload/app/src/main
+          cat > FGDownload/app/src/main/AndroidManifest.xml <<'__FG_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="FG Download"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:extractNativeLibs="true"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __FG_EOF__
+          mkdir -p FGDownload/app/src/main/java/com/fg/download
+          cat > FGDownload/app/src/main/java/com/fg/download/MainActivity.kt <<'__FG_EOF__'
+          package com.fg.download
+
+          import android.annotation.SuppressLint
+          import android.content.*
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.util.Base64
+          import android.webkit.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.webkit.WebViewAssetLoader
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.IOException
+          import java.io.OutputStream
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var web: WebView
+              private var chooserCb: ValueCallback<Array<Uri>>? = null
+              @Volatile private var ready = false
+              @Volatile private var cancelled = false
+
+              private val chooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+                  chooserCb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(r.resultCode, r.data))
+                  chooserCb = null
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  web = WebView(this)
+                  setContentView(web)
+                  web.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; mediaPlaybackRequiresUserGesture = false }
+                  val loader = WebViewAssetLoader.Builder()
+                      .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this)).build()
+                  web.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest) = loader.shouldInterceptRequest(r.url)
+                      override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                          if (r.url.host == "appassets.androidplatform.net") return false
+                          try { startActivity(Intent(Intent.ACTION_VIEW, r.url)) } catch (_: Exception) {}
+                          return true
+                      }
+                  }
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onShowFileChooser(w: WebView, cb: ValueCallback<Array<Uri>>, p: FileChooserParams): Boolean {
+                          chooserCb?.onReceiveValue(null); chooserCb = cb
+                          return try { chooser.launch(p.createIntent()); true } catch (e: Exception) { chooserCb = null; false }
+                      }
+                      override fun onJsConfirm(v: WebView, url: String, msg: String, res: JsResult): Boolean {
+                          AlertDialog.Builder(this@MainActivity).setMessage(msg)
+                              .setPositiveButton("نعم") { _, _ -> res.confirm() }
+                              .setNegativeButton("لا") { _, _ -> res.cancel() }
+                              .setOnCancelListener { res.cancel() }.show()
+                          return true
+                      }
+                  }
+                  web.addJavascriptInterface(Bridge(), "FGNative")
+                  web.loadUrl("https://appassets.androidplatform.net/assets/index.html")
+                  Thread {
+                      try { YoutubeDL.getInstance().init(application); FFmpeg.getInstance().init(application); ready = true }
+                      catch (e: Exception) { js("fgMsg(${JSONObject.quote("فشل تهيئة المحرك: " + e.message)})") }
+                  }.start()
+              }
+
+              override fun onBackPressed() { if (web.canGoBack()) web.goBack() else super.onBackPressed() }
+
+              private fun js(code: String) = runOnUiThread { web.evaluateJavascript("window.$code", null) }
+
+              private fun put(name: String, mime: String, write: (OutputStream) -> Unit) {
+                  val cv = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                      put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/FG Download")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: throw IOException("تعذّر إنشاء الملف")
+                  contentResolver.openOutputStream(uri)!!.use(write)
+              }
+
+              inner class Bridge {
+                  @JavascriptInterface fun download(url: String, type: String, q: String) {
+                      if (!ready) { js("fgDone(false,'المحرك قيد التهيئة، حاول بعد لحظات')"); return }
+                      cancelled = false
+                      Thread {
+                          val dir = File(cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
+                          try {
+                              val req = YoutubeDLRequest(url)
+                              req.addOption("--no-playlist"); req.addOption("--no-mtime")
+                              req.addOption("-o", dir.absolutePath + "/%(id)s.%(ext)s")
+                              if (type == "audio") {
+                                  req.addOption("-x"); req.addOption("--audio-format", "mp3"); req.addOption("--audio-quality", "0")
+                              } else {
+                                  req.addOption("-f", "bv*[height<=$q]+ba/b[height<=$q]/b")
+                                  req.addOption("--merge-output-format", "mp4")
+                              }
+                              YoutubeDL.getInstance().execute(req, "fg") { p, _, _ -> js("fgProgress(${p.toInt()},'جاري التنزيل...')") }
+                              val files = dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }.orEmpty()
+                              if (files.isEmpty()) throw Exception("لم يتم إنتاج ملف")
+                              js("fgProgress(99,'جاري الحفظ...')")
+                              files.forEach { f ->
+                                  val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "application/octet-stream"
+                                  put("FG_${System.currentTimeMillis()}_${f.name}", mime) { o -> f.inputStream().use { it.copyTo(o) } }
+                              }
+                              js("fgDone(true,'تم الحفظ في Download/FG Download')")
+                          } catch (e: Exception) {
+                              val m = if (cancelled) "تم الإلغاء"
+                              else e.message?.lineSequence()?.lastOrNull { it.isNotBlank() }?.take(160) ?: "فشل التنزيل"
+                              js("fgDone(false,${JSONObject.quote(m)})")
+                          } finally { dir.deleteRecursively() }
+                      }.start()
+                  }
+                  @JavascriptInterface fun cancel() { cancelled = true; try { YoutubeDL.getInstance().destroyProcessById("fg") } catch (_: Exception) {} }
+                  @JavascriptInterface fun update() {
+                      Thread {
+                          val m = try { YoutubeDL.getInstance().updateYoutubeDL(application, YoutubeDL.UpdateChannel.STABLE); "تم تحديث المحرك" }
+                          catch (e: Exception) { "فشل التحديث: " + (e.message ?: "") }
+                          js("fgMsg(${JSONObject.quote(m)})")
+                      }.start()
+                  }
+                  @JavascriptInterface fun saveFile(name: String, mime: String, b64: String) {
+                      try {
+                          put("FG_${System.currentTimeMillis()}_$name", mime) { it.write(Base64.decode(b64, Base64.DEFAULT)) }
+                          js("fgMsg('تم الحفظ في Download/FG Download')")
+                      } catch (e: Exception) { js("fgMsg(${JSONObject.quote("فشل الحفظ: " + e.message)})") }
+                  }
+                  @JavascriptInterface fun clipboard(): String {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      return cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString() ?: ""
+                  }
+                  @JavascriptInterface fun copy(t: String) {
+                      (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("url", t))
+                  }
+              }
+          }
+          __FG_EOF__
+          mkdir -p FGDownload/app/src/main/assets
+          cat > FGDownload/app/src/main/assets/index.html <<'__FG_EOF__'
+          <!DOCTYPE html>
+          <html lang="ar" dir="rtl">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <meta name="theme-color" content="#060812">
+          <title>FG Download</title>
+          <style>
+          :root{--bg:#060812;--panel:rgba(15,23,42,.78);--line:rgba(255,255,255,.09);--txt:#f3f4f6;--mut:#94a3b8;--blue:#3b82f6;--ind:#4f46e5;--green:#10b981;--red:#f43f5e}
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;margin:0}
+          html,body{min-height:100%}
+          body{font-family:Cairo,Tahoma,"Segoe UI",system-ui,sans-serif;color:var(--txt);background:var(--bg);
+          background-image:radial-gradient(circle at 10% 15%,rgba(59,130,246,.16),transparent 40%),radial-gradient(circle at 90% 85%,rgba(139,92,246,.16),transparent 40%);
+          background-attachment:fixed;padding:max(12px,env(safe-area-inset-top)) 12px max(24px,env(safe-area-inset-bottom));display:flex;justify-content:center}
+          .app{width:100%;max-width:640px;display:flex;flex-direction:column;gap:14px}
+          .panel{background:var(--panel);border:1px solid var(--line);border-radius:24px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.45)}
+          @supports(backdrop-filter:blur(1px)){.panel{backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}}
+          .card{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:16px}
+          header{display:flex;align-items:center;gap:12px}
+          .logo{width:48px;height:48px;border-radius:16px;background:linear-gradient(135deg,#2563eb,#7c3aed);display:grid;place-items:center;font-weight:900;font-size:22px}
+          h1{font-size:20px;font-weight:900}
+          .sub{font-size:11px;color:var(--mut)}
+          nav{display:flex;gap:4px;padding:6px}
+          nav button{flex:1;padding:11px 4px;border:0;border-radius:14px;background:none;color:var(--mut);font:700 12px inherit;font-family:inherit;cursor:pointer}
+          nav button.on{background:linear-gradient(90deg,#2563eb,var(--ind));color:#fff}
+          section{display:none;flex-direction:column;gap:14px}
+          section.on{display:flex}
+          label,.lbl{font-size:12px;font-weight:700;color:var(--mut);display:block;margin-bottom:6px}
+          .plats{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+          .plat{padding:10px 4px;border-radius:16px;color:var(--txt);font:700 11px inherit;font-family:inherit;cursor:pointer;display:flex;flex-direction:column;gap:4px;align-items:center}
+          .plat b{font-size:20px}
+          .plat.on{border-color:var(--blue);background:rgba(59,130,246,.15)}
+          input[type=url],input[type=text],select{width:100%;padding:13px;border-radius:14px;border:1px solid rgba(255,255,255,.14);background:rgba(10,15,30,.9);color:#fff;font:13px inherit;font-family:inherit;outline:0}
+          input:focus,select:focus{border-color:var(--blue)}
+          .row{display:flex;gap:8px}
+          .seg{display:flex;padding:4px;gap:4px}
+          .seg button{flex:1;padding:9px;border:0;border-radius:11px;background:none;color:var(--mut);font:700 12px inherit;font-family:inherit;cursor:pointer}
+          .seg button.on{background:var(--blue);color:#fff}
+          .btn{border:0;border-radius:14px;padding:14px;font:800 14px inherit;font-family:inherit;color:#fff;cursor:pointer;background:linear-gradient(90deg,#2563eb,var(--ind),#7c3aed)}
+          .btn:disabled{opacity:.5}
+          .btn.sm{padding:10px 14px;font-size:12px;white-space:nowrap}
+          .btn.gr{background:var(--green);color:#022c22}
+          .opts{display:grid;gap:12px;grid-template-columns:1fr}
+          @media(min-width:480px){.opts{grid-template-columns:1fr 1fr}}
+          .prog{display:none;padding:14px;gap:10px;flex-direction:column}
+          .prog.on{display:flex}
+          .bar{height:8px;border-radius:9px;background:#020617;overflow:hidden}
+          .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .15s}
+          .pline{display:flex;justify-content:space-between;font-size:12px;font-weight:700}
+          .msg{font-size:12px;line-height:1.7;color:var(--mut)}
+          .err{color:#fda4af}
+          details summary{font-size:12px;font-weight:700;color:var(--mut);cursor:pointer}
+          details .row{margin-top:10px}
+          .head{display:flex;justify-content:space-between;align-items:center;gap:10px;border-bottom:1px solid var(--line);padding-bottom:12px}
+          .head h3{font-size:13px}
+          .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+          @media(min-width:480px){.grid{grid-template-columns:repeat(3,1fr)}}
+          .empty{grid-column:1/-1;text-align:center;padding:28px 12px;font-size:12px;color:var(--mut)}
+          .wa{overflow:hidden;display:flex;flex-direction:column}
+          .wa .m{height:130px;background:#0f172a}
+          .wa img,.wa video{width:100%;height:100%;object-fit:cover;display:block}
+          .wa .f{display:flex;justify-content:space-between;align-items:center;gap:6px;padding:8px}
+          .wa .n{font-size:10px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;direction:ltr;text-align:left}
+          .hi{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px}
+          .hi .t{min-width:0}
+          .hi h4{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+          .hi p{font-size:10px;color:var(--mut);margin-top:2px}
+          .hi .a{display:flex;gap:4px;flex-shrink:0}
+          .ic{width:36px;height:36px;border:0;border-radius:11px;background:rgba(255,255,255,.08);color:#fff;font-size:15px;cursor:pointer}
+          .ic.d{background:rgba(244,63,94,.15);color:#fda4af}
+          .ic:disabled{opacity:.35}
+          footer{text-align:center;display:flex;flex-direction:column;gap:10px;align-items:center}
+          footer h2{font-size:16px;font-weight:900}
+          footer .links{display:flex;gap:8px;width:100%}
+          footer a{flex:1;padding:10px;border-radius:14px;color:#fff;text-decoration:none;font-size:12px;font-weight:700}
+          #toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);max-width:90%;background:#0f172a;border:1px solid rgba(59,130,246,.45);padding:12px 16px;border-radius:16px;font-size:12px;font-weight:700;opacity:0;pointer-events:none;transition:opacity .25s;z-index:9}
+          #toast.on{opacity:1}
+          #toast.bad{border-color:var(--red)}
+          :focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+          @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+          </style>
+          </head>
+          <body>
+          <div class="app">
+            <header class="panel">
+              <div class="logo">FG</div>
+              <div><h1>FG Download</h1><div class="sub">تحميل الفيديوهات والصور وحفظ الحالات</div></div>
+            </header>
+
+            <nav class="panel" role="tablist">
+              <button class="on" data-tab="dl" role="tab">⬇ تحميل رابط</button>
+              <button data-tab="wa" role="tab">🟢 الحالات</button>
+              <button data-tab="hi" role="tab">🕘 السجل <span id="badge">0</span></button>
+            </nav>
+
+            <main>
+              <!-- تحميل رابط -->
+              <section id="s-dl" class="panel on">
+                <div>
+                  <span class="lbl">المنصة (تُكتشف تلقائياً من الرابط)</span>
+                  <div class="plats" id="plats">
+                    <button class="plat card on" data-p="youtube"><b>▶</b>YouTube</button>
+                    <button class="plat card" data-p="instagram"><b>📷</b>Instagram</button>
+                    <button class="plat card" data-p="tiktok"><b>♪</b>TikTok</button>
+                    <button class="plat card" data-p="x"><b>𝕏</b>منصة X</button>
+                    <button class="plat card" data-p="snapchat"><b>👻</b>Snapchat</button>
+                  </div>
+                </div>
+
+                <div>
+                  <label for="url">رابط الفيديو أو الصورة</label>
+                  <div class="row">
+                    <input type="url" id="url" placeholder="https://..." dir="ltr" autocomplete="off" inputmode="url">
+                    <button class="btn sm" id="paste" type="button">لصق</button>
+                  </div>
+                </div>
+
+                <div class="opts">
+                  <div>
+                    <span class="lbl">النوع</span>
+                    <div class="seg card" id="types">
+                      <button class="on" data-t="video">فيديو</button>
+                      <button data-t="image">صورة</button>
+                      <button data-t="audio">صوت</button>
+                    </div>
+                  </div>
+                  <div>
+                    <label for="q">الجودة (حتى 1080p)</label>
+                    <select id="q">
+                      <option value="1080">1080p Full HD</option>
+                      <option value="720">720p HD</option>
+                      <option value="480">480p SD</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button class="btn" id="go" type="button">بدء التحميل</button>
+
+                <div class="prog card" id="prog">
+                  <div class="pline"><span id="pst">جاري التجهيز...</span><span id="ppc">0%</span></div>
+                  <div class="bar"><i id="pbar"></i></div>
+                  <button class="btn sm" id="cancel" type="button" style="background:#334155">إلغاء</button>
+                </div>
+
+                <details class="card" style="padding:12px" id="set">
+                  <summary>⚙ إعدادات خادم التحميل</summary>
+                  <p class="msg" style="margin-top:8px">المتصفح وحده لا يستطيع تنزيل هذه المنصات بسبب قيود CORS وحماية المنصات. أدخل عنوان خادم متوافق مع واجهة Cobalt API (خادمك الخاص أو خادم عام تثق به).</p>
+                  <div class="row">
+                    <input type="url" id="api" placeholder="https://your-api.example.com/" dir="ltr" autocomplete="off">
+                    <button class="btn sm" id="saveApi" type="button">حفظ</button>
+                  </div>
+                </details>
+              </section>
+
+              <!-- الحالات -->
+              <section id="s-wa" class="panel">
+                <div class="head">
+                  <div><h3>حفظ حالات الواتساب</h3><div class="sub">اختر ملفات الحالات من جهازك ثم احفظها</div></div>
+                  <label class="btn sm gr" style="margin:0;color:#022c22">اختر الحالات
+                    <input type="file" id="wafile" multiple accept="image/*,video/*" hidden>
+                  </label>
+                </div>
+                <div class="msg">مسار الحالات المشاهدة في أندرويد: <span dir="ltr">Android/media/com.whatsapp/WhatsApp/Media/.Statuses</span>. الوصول التلقائي له يحتاج غلاف تطبيق (Capacitor) بصلاحيات تخزين؛ المتصفح لا يمنحه.</div>
+                <div class="grid" id="wagrid"><div class="empty card">لم يتم اختيار حالات بعد</div></div>
+              </section>
+
+              <!-- السجل -->
+              <section id="s-hi" class="panel">
+                <div class="head">
+                  <div><h3>سجل التنزيلات (آخر 30 يوماً)</h3><div class="sub">تُحذف الأقدم تلقائياً</div></div>
+                  <button class="btn sm" id="clearAll" type="button" style="background:rgba(244,63,94,.2);color:#fda4af">مسح السجل</button>
+                </div>
+                <div id="hlist" style="display:flex;flex-direction:column;gap:8px"></div>
+              </section>
+            </main>
+
+            <footer class="panel">
+              <div class="sub">تطوير وتصميم</div>
+              <h2>فيصل عبدالله جميح</h2>
+              <div class="links">
+                <a class="card" style="color:#6ee7b7" href="https://wa.me/967777947217" target="_blank" rel="noopener noreferrer"><span dir="ltr">777947217</span> واتساب</a>
+                <a class="card" style="color:#f9a8d4" href="https://instagram.com/_4e2f" target="_blank" rel="noopener noreferrer">@_4e2f</a>
+              </div>
+              <div class="sub">FG Download v2.2</div>
+            </footer>
+          </div>
+          <div id="toast" role="status" aria-live="polite"></div>
+
+          <script>
+          (function(){
+          'use strict';
+          const $=id=>document.getElementById(id);
+          const HKEY='fg_history_v2', AKEY='fg_api_url', TTL=30*24*60*60*1000;
+          const HOSTS={youtube:['youtube.com','youtu.be','youtube-nocookie.com'],instagram:['instagram.com'],tiktok:['tiktok.com'],x:['x.com','twitter.com'],snapchat:['snapchat.com','snap.com']};
+          const NAMES={youtube:'YouTube',instagram:'Instagram',tiktok:'TikTok',x:'X',snapchat:'Snapchat',whatsapp:'واتساب'};
+          const ICONS={youtube:'▶',instagram:'📷',tiktok:'♪',x:'𝕏',snapchat:'👻',whatsapp:'🟢'};
+          const TYPES={video:'فيديو',image:'صورة',audio:'صوت'};
+          let platform='youtube', mediaType='video', busy=false, ctrl=null, waUrls=[];
+
+          /* ---------- تخزين آمن ---------- */
+          function load(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
+          function save(k,v){try{localStorage.setItem(k,JSON.stringify(v));return true}catch(e){return false}}
+          function getHistory(){const h=load(HKEY,[]);return Array.isArray(h)?h:[]}
+
+          /* ---------- واجهة ---------- */
+          let tt;
+          function toast(m,bad){const t=$('toast');t.textContent=m;t.className='on'+(bad?' bad':'');clearTimeout(tt);tt=setTimeout(()=>t.className='',2600)}
+          function tab(n){
+            document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===n));
+            ['dl','wa','hi'].forEach(k=>$('s-'+k).classList.toggle('on',k===n));
+            if(n==='hi')renderHistory();
+          }
+          document.querySelector('nav').addEventListener('click',e=>{const b=e.target.closest('button');if(b)tab(b.dataset.tab)});
+          function setPlatform(p){platform=p;document.querySelectorAll('.plat').forEach(b=>b.classList.toggle('on',b.dataset.p===p))}
+          $('plats').addEventListener('click',e=>{const b=e.target.closest('.plat');if(b)setPlatform(b.dataset.p)});
+          $('types').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;mediaType=b.dataset.t;
+            document.querySelectorAll('#types button').forEach(x=>x.classList.toggle('on',x===b));$('q').disabled=mediaType!=='video'});
+
+          /* ---------- الروابط ---------- */
+          function parseUrl(s){
+            try{const u=new URL(s.trim());if(u.protocol!=='https:'&&u.protocol!=='http:')return null;return u}catch(e){return null}
+          }
+          function detect(u){
+            const h=u.hostname.toLowerCase();
+            for(const p in HOSTS){if(HOSTS[p].some(d=>h===d||h.endsWith('.'+d)))return p}
+            return null;
+          }
+          $('url').addEventListener('input',()=>{const u=parseUrl($('url').value);if(u){const p=detect(u);if(p)setPlatform(p)}});
+          $('paste').addEventListener('click',async()=>{
+            try{const t=window.FGNative?FGNative.clipboard():await navigator.clipboard.readText();if(t){$('url').value=t.trim();$('url').dispatchEvent(new Event('input'));toast('تم لصق الرابط')}else toast('الحافظة فارغة',true)}
+            catch(e){toast('تعذّر الوصول للحافظة، الصق الرابط يدوياً',true);$('url').focus()}
+          });
+
+          /* ---------- الإعدادات ---------- */
+          $('api').value=load(AKEY,'')||'';
+          $('saveApi').addEventListener('click',()=>{
+            const v=$('api').value.trim();
+            if(v&&!parseUrl(v)){toast('عنوان الخادم غير صالح',true);return}
+            save(AKEY,v);toast('تم حفظ إعدادات الخادم');
+          });
+
+          /* ---------- التحميل ---------- */
+          function progress(pc,st){
+            $('pbar').style.width=pc+'%';$('ppc').textContent=Math.round(pc)+'%';if(st)$('pst').textContent=st;
+          }
+          function setBusy(b){busy=b;$('go').disabled=b;$('prog').classList.toggle('on',b)}
+
+          async function resolveLink(url,type,quality,signal){
+            const api=load(AKEY,'');
+            if(!api){$('set').open=true;throw new Error('أدخل عنوان خادم التحميل في الإعدادات أولاً')}
+            const body={url,videoQuality:quality,downloadMode:type==='audio'?'audio':'auto',audioBitrate:'320',filenameStyle:'basic'};
+            let r;
+            try{r=await fetch(api,{method:'POST',headers:{'Accept':'application/json','Content-Type':'application/json'},body:JSON.stringify(body),signal})}
+            catch(e){if(e.name==='AbortError')throw e;throw new Error('تعذّر الاتصال بالخادم. تحقق من العنوان والإنترنت')}
+            let d;try{d=await r.json()}catch(e){throw new Error('رد غير صالح من الخادم')}
+            if(d.status==='error')throw new Error('رفض الخادم الطلب'+(d.error&&d.error.code?': '+d.error.code:''));
+            if(d.status==='tunnel'||d.status==='redirect')return[{url:d.url,name:d.filename}];
+            if(d.status==='picker'&&Array.isArray(d.picker))return d.picker.filter(x=>x&&x.url).map((x,i)=>({url:x.url,name:'FG_'+Date.now()+'_'+(i+1)+(x.type==='video'?'.mp4':'.jpg')}));
+            throw new Error('استجابة غير متوقعة من الخادم');
+          }
+
+          function saveBlob(blob,name){
+            if(window.FGNative){const fr=new FileReader();fr.onload=()=>FGNative.saveFile(name,blob.type||'application/octet-stream',String(fr.result).split(',')[1]);fr.readAsDataURL(blob);return}
+            const href=URL.createObjectURL(blob);
+            const a=document.createElement('a');a.href=href;a.download=name;a.rel='noopener';
+            document.body.appendChild(a);a.click();a.remove();
+            setTimeout(()=>URL.revokeObjectURL(href),60000);
+          }
+
+          async function fetchFile(item,signal,onPct){
+            const name=item.name||('FG_'+Date.now());
+            let r;
+            try{r=await fetch(item.url,{signal})}
+            catch(e){
+              if(e.name==='AbortError')throw e;
+              // بديل: فتح الرابط مباشرة إذا منع المتصفح القراءة (CORS)
+              const a=document.createElement('a');a.href=item.url;a.download=name;a.target='_blank';a.rel='noopener';
+              document.body.appendChild(a);a.click();a.remove();return;
+            }
+            if(!r.ok)throw new Error('فشل جلب الملف ('+r.status+')');
+            const total=+r.headers.get('content-length')||0;
+            if(!r.body||!total){const b=await r.blob();onPct(100);saveBlob(b,name);return}
+            const rd=r.body.getReader(),parts=[];let got=0;
+            for(;;){const{done,value}=await rd.read();if(done)break;parts.push(value);got+=value.length;onPct(got/total*100)}
+            saveBlob(new Blob(parts),name);
+          }
+
+          async function startDownload(urlStr){
+            if(busy)return;
+            const u=parseUrl(urlStr);
+            if(!u){toast('الرابط غير صالح',true);return}
+            const p=detect(u);
+            if(!p){toast('المنصة غير مدعومة: يوتيوب، إنستغرام، تيك توك، سناب شات، X',true);return}
+            setPlatform(p);
+            const type=mediaType, quality=$('q').value;
+            if(window.FGNative){
+              const nu=u.href,np=p,nt=type,nq=quality;
+              setBusy(true);progress(0,'جاري التحضير...');
+              window.fgProgress=(pc,st)=>progress(pc,st);
+              window.fgDone=(ok,msg)=>{
+                if(ok){progress(100,'اكتمل');addHistory(nu,np,nt==='video'?nq+'p':TYPES[nt],nt);toast(msg);$('url').value=''}
+                else toast(msg,true);
+                setTimeout(()=>setBusy(false),500);
+              };
+              FGNative.download(nu,nt,nq);
+              return;
+            }
+            ctrl=new AbortController();setBusy(true);progress(0,'جاري استخراج رابط التنزيل...');
+            try{
+              const items=await resolveLink(u.href,type,quality,ctrl.signal);
+              if(!items.length)throw new Error('لا توجد ملفات متاحة في هذا الرابط');
+              for(let i=0;i<items.length;i++){
+                progress(0,'جاري التنزيل '+(items.length>1?'('+(i+1)+'/'+items.length+')':'')+'...');
+                await fetchFile(items[i],ctrl.signal,pc=>progress(pc));
+              }
+              progress(100,'اكتمل التنزيل');
+              addHistory(u.href,p,type==='video'?quality+'p':TYPES[type],type);
+              toast('تم التنزيل بنجاح');
+              $('url').value='';
+            }catch(e){
+              if(e.name==='AbortError')toast('تم إلغاء التنزيل');
+              else toast(e.message||'حدث خطأ غير متوقع',true);
+            }finally{
+              setTimeout(()=>{if(!busy)return;setBusy(false)},600);
+              ctrl=null;
+            }
+          }
+          $('go').addEventListener('click',()=>startDownload($('url').value));
+          $('cancel').addEventListener('click',()=>{if(window.FGNative)FGNative.cancel();if(ctrl)ctrl.abort()});
+
+          /* ---------- حالات الواتساب ---------- */
+          function freeWA(){waUrls.forEach(u=>URL.revokeObjectURL(u));waUrls=[]}
+          $('wafile').addEventListener('change',e=>{
+            const files=Array.from(e.target.files||[]);
+            if(!files.length)return;
+            freeWA();
+            const g=$('wagrid');g.textContent='';
+            files.forEach(f=>{
+              const isVid=f.type.startsWith('video/');
+              if(!isVid&&!f.type.startsWith('image/'))return;
+              const url=URL.createObjectURL(f);waUrls.push(url);
+              const c=document.createElement('div');c.className='wa card';
+              const m=document.createElement('div');m.className='m';
+              const el=document.createElement(isVid?'video':'img');
+              el.src=url;
+              if(isVid){el.muted=true;el.controls=true;el.preload='metadata';el.playsInline=true}
+              else{el.loading='lazy';el.alt=''}
+              m.appendChild(el);
+              const ft=document.createElement('div');ft.className='f';
+              const n=document.createElement('span');n.className='n';n.textContent=f.name;
+              const b=document.createElement('button');b.className='btn sm gr';b.type='button';b.textContent='حفظ';
+              b.addEventListener('click',()=>{saveBlob(f,'FG_WhatsApp_'+f.name);addHistory('','whatsapp','أصلية','status');toast('تم حفظ الحالة')});
+              ft.append(n,b);c.append(m,ft);g.appendChild(c);
+            });
+            e.target.value='';
+            toast('تم تحميل '+files.length+' ملف');
+          });
+          window.addEventListener('pagehide',freeWA);
+
+          /* ---------- السجل ---------- */
+          function cleanHistory(){
+            const now=Date.now();
+            const h=getHistory().filter(i=>i&&now-i.ts<TTL);
+            save(HKEY,h);return h;
+          }
+          function addHistory(url,plat,quality,type){
+            const h=cleanHistory();
+            h.unshift({id:Date.now()+'-'+Math.random().toString(36).slice(2,6),url,plat,quality,type,ts:Date.now()});
+            save(HKEY,h.slice(0,200));
+            renderHistory();
+          }
+          function renderHistory(){
+            const h=cleanHistory(),list=$('hlist');
+            $('badge').textContent=h.length;
+            list.textContent='';
+            if(!h.length){const d=document.createElement('div');d.className='empty card';d.textContent='لا توجد تنزيلات في السجل';list.appendChild(d);return}
+            h.forEach(i=>{
+              const row=document.createElement('div');row.className='hi card';
+              const t=document.createElement('div');t.className='t';
+              const h4=document.createElement('h4');h4.textContent=(ICONS[i.plat]||'🔗')+' '+(NAMES[i.plat]||i.plat)+' - '+i.quality;
+              const p=document.createElement('p');p.textContent=new Date(i.ts).toLocaleString('ar',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+              t.append(h4,p);
+              const a=document.createElement('div');a.className='a';
+              const mk=(txt,act,cls,dis)=>{const b=document.createElement('button');b.type='button';b.className='ic '+(cls||'');b.textContent=txt;b.dataset.act=act;b.dataset.id=i.id;b.disabled=!!dis;b.title={re:'إعادة التحميل',cp:'نسخ الرابط',rm:'حذف'}[act];return b};
+              a.append(mk('↻','re','',!i.url),mk('⧉','cp','',!i.url),mk('✕','rm','d'));
+              row.append(t,a);list.appendChild(row);
+            });
+          }
+          $('hlist').addEventListener('click',async e=>{
+            const b=e.target.closest('button');if(!b||b.disabled)return;
+            const h=getHistory(),it=h.find(x=>x.id===b.dataset.id);
+            if(b.dataset.act==='rm'){save(HKEY,h.filter(x=>x.id!==b.dataset.id));renderHistory();toast('تم الحذف من السجل');return}
+            if(!it)return;
+            if(b.dataset.act==='cp'){
+              try{if(window.FGNative)FGNative.copy(it.url);else await navigator.clipboard.writeText(it.url);toast('تم نسخ الرابط')}catch(_){toast('تعذّر النسخ',true)}
+            }else if(b.dataset.act==='re'){
+              tab('dl');
+              mediaType=it.type==='audio'||it.type==='image'?it.type:'video';
+              document.querySelectorAll('#types button').forEach(x=>x.classList.toggle('on',x.dataset.t===mediaType));
+              $('q').disabled=mediaType!=='video';
+              $('url').value=it.url;
+              startDownload(it.url);
+            }
+          });
+          $('clearAll').addEventListener('click',()=>{
+            if(!getHistory().length)return;
+            if(!confirm('هل تريد مسح السجل بالكامل؟'))return;
+            try{localStorage.removeItem(HKEY)}catch(e){}
+            renderHistory();toast('تم مسح السجل');
+          });
+          document.addEventListener('visibilitychange',()=>{if(!document.hidden)renderHistory()});
+
+          window.fgMsg=m=>toast(m);
+          if(window.FGNative){
+            $('set').innerHTML='<summary>⚙ المحرك</summary><p class="msg" style="margin-top:8px">المحرك (yt-dlp) مدمج داخل التطبيق. إذا توقف موقع عن العمل فحدّث المحرك.</p><button class="btn sm" id="upd" type="button" style="margin-top:10px">تحديث المحرك</button>';
+            $('upd').onclick=()=>{toast('جاري التحديث...');FGNative.update()};
+          }
+          renderHistory();
+          })();
+          </script>
+          </body>
+          </html>
+          __FG_EOF__
+      - name: Build APK
+        run: |
+          cd FGDownload
+          gradle assembleDebug --no-daemon --stacktrace
+      - name: Rename APK
+        run: cp FGDownload/app/build/outputs/apk/debug/app-debug.apk FG-Download.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: FG Download build ${{ github.run_number }}
+          files: FG-Download.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FG-Download-APK
+          path: FG-Download.apk
